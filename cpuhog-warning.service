@@ -1,0 +1,16 @@
+[Unit]
+Description=CPU Hog Warning
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cpuhog-warning
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cpuhog-warning
+
+[Install]
+WantedBy=default.target
