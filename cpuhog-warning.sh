@@ -15,167 +15,211 @@ REALERT=300
 # Check interval (seconds)
 INTERVAL=30
 
-# Plasmashell-specific monitoring (uses real-time delta CPU, not ps lifetime average)
-PLASMA_THRESHOLD=10   # % of one core to trigger tracking
-PLASMA_SUSTAIN=30     # seconds before alerting
+# Plasmashell-specific monitoring (uses the unified /proc scan, but lower thresholds)
+PLASMA_THRESHOLD=10
+PLASMA_SUSTAIN=30
 
-STATE_DIR="$HOME/.local/share/cpuhog-warning/state"
-LOG_FILE="$HOME/.local/share/cpuhog-warning/log"
+STATE_BASE="$HOME/.local/share/cpuhog-warning"
+LOG_FILE="$STATE_BASE/log"
+ACTIONS_FILE="$STATE_BASE/actions"
 DBUS_ADDR="unix:path=/run/user/$(id -u)/bus"
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_BASE"
+touch "$LOG_FILE" "$ACTIONS_FILE"
 
-alert() {
-    local msg="$1"
+declare -A FIRST_SEEN
+declare -A LAST_ALERTED
+declare -A TEMP_WHITELIST
+declare -A PREV_PROC_TICKS
+declare -A CMD_BY_PID
+
+PREV_TOTAL_TICKS=0
+NCPUS="$(nproc)"
+
+log_line() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+queue_action() {
+    local action="$1"
     local pid="$2"
-    local state_file="$3"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOG_FILE"
+    printf '%s %s\n' "$action" "$pid" >> "$ACTIONS_FILE"
+}
+
+is_name_whitelisted() {
+    local cmd="$1"
+    local item
+    for item in "${WHITELIST[@]}"; do
+        [[ "$cmd" == *"$item"* ]] && return 0
+    done
+    return 1
+}
+
+format_cpu_pct() {
+    local tenths="$1"
+    printf '%d.%d' "$(( tenths / 10 ))" "$(( tenths % 10 ))"
+}
+
+handle_pending_actions() {
+    [[ -s "$ACTIONS_FILE" ]] || return
+
+    while read -r action pid; do
+        [[ -n "$action" && -n "$pid" ]] || continue
+        case "$action" in
+            whitelist)
+                TEMP_WHITELIST["$pid"]=1
+                log_line "Whitelisted PID $pid via notification"
+                ;;
+        esac
+    done < "$ACTIONS_FILE"
+
+    : > "$ACTIONS_FILE"
+}
+
+alert_process() {
+    local title="$1"
+    local msg="$2"
+    local pid="$3"
+    local action_primary="$4"
+    local action_label="$5"
+
+    log_line "$msg"
     (
+        local action
         action=$(DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
-            notify-send --app-name="cpuhog-warning" -t 0 "CPU Hog Warning" "$msg" \
+            notify-send --app-name="cpuhog-warning" -t 0 "$title" "$msg" \
             -i dialog-warning \
-            --action="kill=Kill Process" \
+            --action="${action_primary}=${action_label}" \
             --action="whitelist=Whitelist" \
             --wait)
-        if [[ "$action" == "kill" ]]; then
-            kill "$pid" 2>/dev/null \
-                && echo "$(date '+%Y-%m-%d %H:%M:%S') Killed PID $pid via notification" >> "$LOG_FILE"
-        elif [[ "$action" == "whitelist" ]]; then
-            # Mark as temp-whitelisted in state file (field 3)
-            if [[ -f "$state_file" ]]; then
-                read -r first_seen last_alerted _tw stored_cmd < "$state_file"
-                echo "$first_seen $last_alerted 1 $stored_cmd" > "$state_file"
-                echo "$(date '+%Y-%m-%d %H:%M:%S') Whitelisted PID $pid via notification" >> "$LOG_FILE"
+
+        if [[ "$action" == "$action_primary" ]]; then
+            if [[ "$action_primary" == "kill" ]]; then
+                kill "$pid" 2>/dev/null \
+                    && log_line "Killed PID $pid via notification"
+            elif [[ "$action_primary" == "restart" ]]; then
+                kill "$pid" 2>/dev/null
+                sleep 1
+                DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" kstart plasmashell &
+                log_line "Restarted plasmashell (killed PID $pid) via notification"
             fi
+        elif [[ "$action" == "whitelist" ]]; then
+            queue_action whitelist "$pid"
         fi
     ) &
 }
 
-check() {
-    local now
-    now=$(date +%s)
-    declare -A active_pids
+read_total_ticks() {
+    local _cpu user nice system idle iowait irq softirq steal guest guest_nice
+    read -r _cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    printf '%s\n' $(( user + nice + system + idle + iowait + irq + softirq + steal ))
+}
 
-    while read -r cpu pid cmd; do
-        [[ "$pid" == "$$" ]] && continue
-
-        local whitelisted=false
-        for w in "${WHITELIST[@]}"; do
-            [[ "$cmd" == *"$w"* ]] && whitelisted=true && break
-        done
-        [[ "$whitelisted" == true ]] && continue
-
-        active_pids["$pid"]=1
-        local state_file="$STATE_DIR/$pid"
-
-        if [[ -f "$state_file" ]]; then
-            local first_seen last_alerted temp_whitelisted stored_cmd
-            read -r first_seen last_alerted temp_whitelisted stored_cmd < "$state_file"
-            local elapsed=$(( now - first_seen ))
-            local since_alerted=$(( now - last_alerted ))
-
-            [[ "$temp_whitelisted" == "1" ]] && continue
-
-            if [[ "$elapsed" -ge "$SUSTAIN" ]] && \
-               { [[ "$last_alerted" == "0" ]] || [[ "$since_alerted" -ge "$REALERT" ]]; }; then
-                alert "High CPU: $(basename "$cmd") (PID $pid) at ${cpu}% for $((elapsed/60))m" "$pid" "$state_file"
-                echo "$first_seen $now 0 $stored_cmd" > "$state_file"
-            fi
-        else
-            echo "$now 0 0 $cmd" > "$state_file"
+cleanup_missing_pids() {
+    local -n active_ref="$1"
+    local pid
+    for pid in "${!PREV_PROC_TICKS[@]}"; do
+        if [[ -z "${active_ref[$pid]:-}" ]]; then
+            unset PREV_PROC_TICKS["$pid"]
+            unset FIRST_SEEN["$pid"]
+            unset LAST_ALERTED["$pid"]
+            unset TEMP_WHITELIST["$pid"]
+            unset CMD_BY_PID["$pid"]
         fi
-    done < <(ps aux --no-headers | awk -v t="$THRESHOLD" '$3 >= t && $11 !~ /\/ps$/ {print $3, $2, $11}')
-
-    # Clean up state files for processes no longer over threshold
-    for state_file in "$STATE_DIR"/*; do
-        [[ -f "$state_file" ]] || continue
-        local pid
-        pid=$(basename "$state_file")
-        [[ -z "${active_pids[$pid]}" ]] && rm "$state_file"
     done
 }
 
-alert_plasmashell() {
-    local msg="$1"
-    local pid="$2"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOG_FILE"
-    (
-        action=$(DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
-            notify-send --app-name="cpuhog-warning" -t 0 "Plasmashell CPU Spike" "$msg" \
-            -i dialog-warning \
-            --action="restart=Restart Plasma" \
-            --action="whitelist=Whitelist" \
-            --wait)
-        if [[ "$action" == "restart" ]]; then
-            kill "$pid" 2>/dev/null
-            sleep 1
-            DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" kstart plasmashell &
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Restarted plasmashell (killed PID $pid) via notification" >> "$LOG_FILE"
-        elif [[ "$action" == "whitelist" ]]; then
-            echo "$pid" > "$STATE_DIR/plasmashell_whitelist"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Whitelisted plasmashell PID $pid via notification" >> "$LOG_FILE"
+scan_processes() {
+    local now total_ticks delta_total
+    local -A active_pids=()
+
+    handle_pending_actions
+
+    now="$(date +%s)"
+    total_ticks="$(read_total_ticks)"
+    delta_total=$(( total_ticks - PREV_TOTAL_TICKS ))
+
+    local proc_dir pid stat_line comm rest utime stime proc_ticks delta_proc
+    local cmd cpu_tenths threshold sustain title msg elapsed since_alert
+
+    for proc_dir in /proc/[0-9]*; do
+        [[ -r "$proc_dir/stat" ]] || continue
+        pid="${proc_dir##*/}"
+        [[ "$pid" == "$$" ]] && continue
+
+        stat_line="$(<"$proc_dir/stat")" || continue
+        [[ "$stat_line" =~ ^([0-9]+)\ \((.*)\)\ ([A-Z])\ (.*)$ ]] || continue
+        comm="${BASH_REMATCH[2]}"
+        rest="${BASH_REMATCH[4]}"
+        read -r -a fields <<< "$rest"
+        (( ${#fields[@]} >= 12 )) || continue
+        utime="${fields[10]}"
+        stime="${fields[11]}"
+        proc_ticks=$(( utime + stime ))
+
+        active_pids["$pid"]=1
+        CMD_BY_PID["$pid"]="$comm"
+
+        if [[ -z "${PREV_PROC_TICKS[$pid]:-}" ]]; then
+            PREV_PROC_TICKS["$pid"]="$proc_ticks"
+            continue
         fi
-    ) &
-}
 
-check_plasmashell() {
-    local pid
-    pid=$(pgrep -x plasmashell 2>/dev/null | head -1)
-    [[ -z "$pid" ]] && return
+        delta_proc=$(( proc_ticks - PREV_PROC_TICKS[$pid] ))
+        PREV_PROC_TICKS["$pid"]="$proc_ticks"
 
-    # Clear whitelist if plasmashell has been restarted (new PID)
-    local wl_file="$STATE_DIR/plasmashell_whitelist"
-    if [[ -f "$wl_file" ]]; then
-        local wl_pid; wl_pid=$(cat "$wl_file")
-        [[ "$wl_pid" == "$pid" ]] && return
-        rm -f "$wl_file"
-    fi
+        if (( delta_total <= 0 || delta_proc < 0 )); then
+            continue
+        fi
 
-    local now; now=$(date +%s)
-    local tick_file="$STATE_DIR/plasmashell_ticks"
-    local sustain_file="$STATE_DIR/plasmashell_sustain"
-    local ncpus; ncpus=$(nproc)
+        cpu_tenths=$(( 1000 * delta_proc * NCPUS / delta_total ))
+        cmd="${CMD_BY_PID[$pid]}"
 
-    local cur_proc
-    cur_proc=$(awk '{print $14+$15}' /proc/"$pid"/stat 2>/dev/null) || return
-    local cur_total
-    cur_total=$(awk 'NR==1{for(i=2;i<=11;i++) sum+=$i; print sum}' /proc/stat)
+        if [[ "$cmd" == "plasmashell" ]]; then
+            threshold=$(( PLASMA_THRESHOLD * 10 ))
+            sustain="$PLASMA_SUSTAIN"
+        else
+            is_name_whitelisted "$cmd" && continue
+            threshold=$(( THRESHOLD * 10 ))
+            sustain="$SUSTAIN"
+        fi
 
-    if [[ -f "$tick_file" ]]; then
-        local prev_proc prev_total
-        read -r prev_proc prev_total < "$tick_file"
-        local delta_proc=$(( cur_proc - prev_proc ))
-        local delta_total=$(( cur_total - prev_total ))
+        if [[ -n "${TEMP_WHITELIST[$pid]:-}" ]]; then
+            continue
+        fi
 
-        if [[ "$delta_total" -gt 0 ]]; then
-            local cpu_pct
-            cpu_pct=$(awk "BEGIN {printf \"%.1f\", 100*$delta_proc/$delta_total*$ncpus}")
-
-            if awk "BEGIN {exit ($cpu_pct >= $PLASMA_THRESHOLD) ? 0 : 1}"; then
-                if [[ -f "$sustain_file" ]]; then
-                    local first_seen last_alerted
-                    read -r first_seen last_alerted < "$sustain_file"
-                    local elapsed=$(( now - first_seen ))
-                    local since_alerted=$(( now - last_alerted ))
-                    if [[ "$elapsed" -ge "$PLASMA_SUSTAIN" ]] && \
-                       { [[ "$last_alerted" == "0" ]] || [[ "$since_alerted" -ge "$REALERT" ]]; }; then
-                        alert_plasmashell "plasmashell spiking at ${cpu_pct}% (PID $pid)" "$pid"
-                        echo "$first_seen $now" > "$sustain_file"
-                    fi
-                else
-                    echo "$now 0" > "$sustain_file"
-                fi
-            else
-                rm -f "$sustain_file"
+        if (( cpu_tenths >= threshold )); then
+            if [[ -z "${FIRST_SEEN[$pid]:-}" ]]; then
+                FIRST_SEEN["$pid"]="$now"
+                LAST_ALERTED["$pid"]=0
+                continue
             fi
-        fi
-    fi
 
-    echo "$cur_proc $cur_total" > "$tick_file"
+            elapsed=$(( now - FIRST_SEEN[$pid] ))
+            since_alert=$(( now - ${LAST_ALERTED[$pid]:-0} ))
+            if (( elapsed >= sustain )) && { (( ${LAST_ALERTED[$pid]:-0} == 0 )) || (( since_alert >= REALERT )); }; then
+                if [[ "$cmd" == "plasmashell" ]]; then
+                    title="Plasmashell CPU Spike"
+                    msg="plasmashell spiking at $(format_cpu_pct "$cpu_tenths")% (PID $pid)"
+                    alert_process "$title" "$msg" "$pid" restart "Restart Plasma"
+                else
+                    title="CPU Hog Warning"
+                    msg="High CPU: $cmd (PID $pid) at $(format_cpu_pct "$cpu_tenths")% for $(( elapsed / 60 ))m"
+                    alert_process "$title" "$msg" "$pid" kill "Kill Process"
+                fi
+                LAST_ALERTED["$pid"]="$now"
+            fi
+        else
+            unset FIRST_SEEN["$pid"]
+            unset LAST_ALERTED["$pid"]
+        fi
+    done
+
+    PREV_TOTAL_TICKS="$total_ticks"
+    cleanup_missing_pids active_pids
 }
 
 while true; do
-    check
-    check_plasmashell
+    scan_processes
     sleep "$INTERVAL"
 done
