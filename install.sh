@@ -33,7 +33,8 @@ install -d -m755 "$USER_SYSTEMD_DIR"
 install -Dm644 "$ROOT_DIR/$USER_SERVICE_NAME" "$USER_SERVICE_PATH"
 
 run_as_user systemctl --user daemon-reload
-run_as_user systemctl --user enable --now "$USER_SERVICE_NAME"
+run_as_user systemctl --user enable "$USER_SERVICE_NAME"
+run_as_user systemctl --user restart "$USER_SERVICE_NAME"
 
 printf 'Installed:\n'
 printf '  %s\n' "$TARGET"

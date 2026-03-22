@@ -38,14 +38,14 @@ Edit the top of `cpuhog-warning.sh` before installing:
 |------|-------------|
 | `/usr/local/bin/cpuhog-warning` | Installed daemon |
 | `~/.config/systemd/user/cpuhog-warning.service` | Systemd user unit |
-| `~/.local/share/cpu-monitor/log` | Alert log |
-| `~/.local/share/cpu-monitor/state/` | Per-PID tracking state |
+| `~/.local/share/cpuhog-warning/log` | Alert log |
+| `~/.local/share/cpuhog-warning/state/` | Per-PID tracking state |
 
 ## Logs
 
 ```bash
 journalctl --user -u cpuhog-warning.service -f
-tail -f ~/.local/share/cpu-monitor/log
+tail -f ~/.local/share/cpuhog-warning/log
 ```
 
 ## Service management
