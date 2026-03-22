@@ -175,6 +175,8 @@ scan_processes() {
             continue
         fi
 
+        (( delta_total == 0 )) && continue
+
         cpu_tenths=$(( 1000 * delta_proc * NCPUS / delta_total ))
         cmd="${CMD_BY_PID[$pid]}"
 
