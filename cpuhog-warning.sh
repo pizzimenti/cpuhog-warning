@@ -32,9 +32,11 @@ declare -A LAST_ALERTED
 declare -A TEMP_WHITELIST
 declare -A PREV_PROC_TICKS
 declare -A CMD_BY_PID
+declare -A SEEN_GEN
 
 PREV_TOTAL_TICKS=0
 NCPUS="$(nproc)"
+SCAN_GEN=0
 
 log_line() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
@@ -116,10 +118,11 @@ read_total_ticks() {
 }
 
 cleanup_missing_pids() {
-    local -n active_ref="$1"
+    local current_gen="$1"
     local pid
-    for pid in "${!PREV_PROC_TICKS[@]}"; do
-        if [[ -z "${active_ref[$pid]:-}" ]]; then
+    for pid in "${!SEEN_GEN[@]}"; do
+        if (( current_gen - ${SEEN_GEN[$pid]} > 1 )); then
+            unset SEEN_GEN["$pid"]
             unset PREV_PROC_TICKS["$pid"]
             unset FIRST_SEEN["$pid"]
             unset LAST_ALERTED["$pid"]
@@ -131,9 +134,9 @@ cleanup_missing_pids() {
 
 scan_processes() {
     local now total_ticks delta_total
-    local -A active_pids=()
 
     handle_pending_actions
+    (( SCAN_GEN += 1 ))
 
     now="$(date +%s)"
     total_ticks="$(read_total_ticks)"
@@ -157,7 +160,7 @@ scan_processes() {
         stime="${fields[11]}"
         proc_ticks=$(( utime + stime ))
 
-        active_pids["$pid"]=1
+        SEEN_GEN["$pid"]="$SCAN_GEN"
         CMD_BY_PID["$pid"]="$comm"
 
         if [[ -z "${PREV_PROC_TICKS[$pid]:-}" ]]; then
@@ -216,7 +219,7 @@ scan_processes() {
     done
 
     PREV_TOTAL_TICKS="$total_ticks"
-    cleanup_missing_pids active_pids
+    cleanup_missing_pids "$SCAN_GEN"
 }
 
 while true; do
