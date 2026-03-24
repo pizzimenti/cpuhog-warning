@@ -15,6 +15,9 @@ REALERT=300
 # Check interval (seconds)
 INTERVAL=30
 
+# Notification lifetime (milliseconds)
+NOTIFY_EXPIRE_MS=$((20 * 60 * 1000))
+
 # Plasmashell-specific monitoring (uses the unified /proc scan, but lower thresholds)
 PLASMA_THRESHOLD=10
 PLASMA_SUSTAIN=30
@@ -89,7 +92,10 @@ alert_process() {
     (
         local action
         action=$(DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
-            notify-send --app-name="cpuhog-warning" -t 0 "$title" "$msg" \
+            notify-send --app-name="cpuhog-warning" \
+            --transient \
+            --expire-time="$NOTIFY_EXPIRE_MS" \
+            "$title" "$msg" \
             -i dialog-warning \
             --action="${action_primary}=${action_label}" \
             --action="whitelist=Whitelist" \

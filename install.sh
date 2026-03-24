@@ -35,6 +35,7 @@ install -Dm644 "$ROOT_DIR/$USER_SERVICE_NAME" "$USER_SERVICE_PATH"
 run_as_user systemctl --user daemon-reload
 run_as_user systemctl --user enable "$USER_SERVICE_NAME"
 run_as_user systemctl --user restart "$USER_SERVICE_NAME"
+run_as_user pkill -f 'notify-send.real --app-name=cpuhog-warning' || true
 
 printf 'Installed:\n'
 printf '  %s\n' "$TARGET"
