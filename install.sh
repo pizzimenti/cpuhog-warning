@@ -29,8 +29,8 @@ install -Dm755 "$ROOT_DIR/cpuhog-warning.sh" "$TARGET"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 USER_SERVICE_PATH="$USER_SYSTEMD_DIR/$USER_SERVICE_NAME"
 
-install -d -m755 "$USER_SYSTEMD_DIR"
-install -Dm644 "$ROOT_DIR/$USER_SERVICE_NAME" "$USER_SERVICE_PATH"
+run_as_user mkdir -p "$USER_SYSTEMD_DIR"
+run_as_user install -Dm644 "$ROOT_DIR/$USER_SERVICE_NAME" "$USER_SERVICE_PATH"
 
 run_as_user systemctl --user daemon-reload
 run_as_user systemctl --user enable "$USER_SERVICE_NAME"
