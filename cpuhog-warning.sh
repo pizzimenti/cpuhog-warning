@@ -106,10 +106,8 @@ alert_process() {
                 kill "$pid" 2>/dev/null \
                     && log_line "Killed PID $pid via notification"
             elif [[ "$action_primary" == "restart" ]]; then
-                kill "$pid" 2>/dev/null
-                sleep 1
-                DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" kstart plasmashell &
-                log_line "Restarted plasmashell (killed PID $pid) via notification"
+                systemctl --user restart plasma-plasmashell.service \
+                    && log_line "Restarted plasmashell via systemd notification action"
             fi
         elif [[ "$action" == "whitelist" ]]; then
             queue_action whitelist "$pid"
